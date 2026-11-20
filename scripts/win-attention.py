@@ -5,9 +5,11 @@
       PreCompact 只做标记：压缩本身也会触发一次无类型 SubagentStop，靠这个标记略过
 原生 Windows（Git Bash）不走本文件：run.sh 直接调 exe --hook，判断逻辑在 win-attention.cs 的 HookMode，改动要两边同步
 做法：
-  1. hook 找到 Claude 所在的 tty，写一个一次性临时标题（OSC 0），让 Windows 端用 UI Automation 认出是哪个 WT 分页；
-  2. 后台进程按需用 Windows 自带 csc.exe 把 win-attention.cs 编译成 exe（按源码哈希命名，源码改了自动重编），
-     启动 exe（已有宿主进程时经命名管道交给它，自己立即退出），等宿主认出分页后把标题还原。
+  1. 后台进程按需用 Windows 自带 csc.exe 把 win-attention.cs 编译成 exe（按源码哈希命名，源码改了自动重编），
+     启动 exe（已有宿主进程时经命名管道交给它，自己立即退出）；
+  2. 进度值标记认分页（不依赖分页标题）：宿主挑一个没有分页在用的进度值 N 写进 ready-<id>，后台进程往 Claude
+     所在的 tty 写 OSC 9;4;1;N，宿主用 UI Automation 找出进度圈数值为 N 的分页，写 found-<id>（该分页原来的进度），
+     后台进程据此还原。认不出时宿主再按会话标题找。
 测试：echo '{"hook_event_name":"Stop","cwd":"/x/demo"}' | win-attention.py --demo [--wait]
 状态档（记录、标记、缓存）放 $CLAUDE_PLUGIN_DATA；不是以 plugin 运行时放 ~/.claude/win-attention/。
 非 WSL 环境（macOS、纯 Linux）直接退出，不做任何事。
@@ -132,15 +134,24 @@ def find_tty():
     return ""
 
 
-def set_title(tty, title):
+def set_progress(tty, spec):
+    """写 WT 分页进度（OSC 9;4;<状态>;<数值>）。spec 形如 "1;37"，"0;0" 为清除。"""
     try:
         fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
         try:
-            os.write(fd, ("\033]0;%s\007" % title).encode())
+            os.write(fd, ("\033]9;4;%s\007" % spec).encode())
         finally:
             os.close(fd)
     except OSError:
         pass
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 def app_dir():
@@ -198,23 +209,36 @@ def ensure_exe(adir):
     return exe
 
 
-def background(b64, tty, marker):
+def background(b64, tty, probe):
     adir = app_dir()
     exe = ensure_exe(adir)
-    if exe:
-        subprocess.Popen([exe, b64], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         cwd="/mnt/c", start_new_session=True)
-    if tty and marker:  # 持续重写临时标题直到宿主认出分页（最多 5 秒），再还原
-        found = os.path.join(adir, "found-" + marker)
-        deadline = time.time() + 5
+    if not exe:
+        return
+    subprocess.Popen([exe, b64], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     cwd="/mnt/c", start_new_session=True)
+    if not (tty and probe):
+        return
+    ready, found = (os.path.join(adir, p + probe) for p in ("ready-", "found-"))
+    deadline = time.time() + 15  # 等宿主挑好进度值（宿主冷启动要一两秒）
+    while time.time() < deadline and not found_or_ready(found, ready):
+        time.sleep(0.05)
+    n = read_text(ready)
+    if n.isdigit():  # 持续写进度值直到宿主认出分页（宿主最多找 3 秒，超时也会写 found）
+        deadline = time.time() + 6
         while time.time() < deadline and not os.path.exists(found):
-            set_title(tty, marker)
-            time.sleep(0.08)
-        set_title(tty, "")
+            set_progress(tty, "1;" + n)
+            time.sleep(0.1)
+        restore = read_text(found)
+        set_progress(tty, restore if re.fullmatch(r"[0-4];\d{1,3}", restore) else "0;0")
+    for f in (ready, found):
         try:
-            os.remove(found)
+            os.remove(f)
         except OSError:
             pass
+
+
+def found_or_ready(found, ready):
+    return os.path.exists(found) or read_text(ready).isdigit()
 
 
 def clean(text, limit=140):
@@ -224,8 +248,8 @@ def clean(text, limit=140):
 
 def main():
     if len(sys.argv) >= 5 and sys.argv[1] == "--bg":
-        tty, marker = (None if a == "-" else a for a in sys.argv[3:5])
-        return background(sys.argv[2], tty, marker)
+        tty, probe = (None if a == "-" else a for a in sys.argv[3:5])
+        return background(sys.argv[2], tty, probe)
     if "microsoft" not in platform.release().lower() or not os.path.exists(CMD):  # 只支持 WSL
         return
     os.makedirs(DATA, exist_ok=True)
@@ -289,20 +313,17 @@ def main():
         return
 
     tty = find_tty()
-    title = ai_title(data.get("transcript_path", ""))
-    # 有对话标题就靠它认分页；没有才用临时标题（会盖住 Claude 的标题，所以两者不同时用）
-    marker = "cc-" + secrets.token_hex(5) if (tty and not title and os.environ.get("WT_SESSION")) else ""
-    if marker:
-        set_title(tty, marker)
+    title = ai_title(data.get("transcript_path", ""))  # 进度值标记认不出时的后备
+    probe = "pm-" + secrets.token_hex(5) if (tty and os.environ.get("WT_SESSION")) else ""
 
     key = data.get("session_id") or os.environ.get("WT_SESSION") or project
     if event == "SubagentStop":
         key += ":btw"  # 不取代同一对话里的其他卡
     fields = {"key": key, "project": clean(project, 80),
               "label": label, "color": color, "summary": clean(summary), "glyph": glyph, "progress": str(progress),
-              "hint": HINT, "demo": "1" if "--demo" in sys.argv else "0", "marker": marker, "title": title}
+              "hint": HINT, "demo": "1" if "--demo" in sys.argv else "0", "probe": probe, "title": title}
     b64 = base64.b64encode("\n".join("%s\t%s" % kv for kv in fields.items()).encode()).decode()
-    cmd = [sys.executable, os.path.abspath(__file__), "--bg", b64, tty or "-", marker or "-"]
+    cmd = [sys.executable, os.path.abspath(__file__), "--bg", b64, tty or "-", probe or "-"]
     if "--wait" in sys.argv:  # 前台运行，便于排错
         sys.exit(subprocess.run(cmd).returncode)
     with open(ERR, "w") as err:

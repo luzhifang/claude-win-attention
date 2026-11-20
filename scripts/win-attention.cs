@@ -61,7 +61,7 @@ static class W {
 
 class Alert {
   public string Id = Guid.NewGuid().ToString("N");
-  public string Key, Project, Label, Summary, Hint, Glyph, Marker, Title;
+  public string Key, Project, Label, Summary, Hint, Glyph, Probe, Title;
   public Color Color; public int Progress; public bool Demo;
   public DateTime Created = DateTime.Now;
   public IntPtr Wt = IntPtr.Zero; public AutomationElement Tab;
@@ -71,7 +71,7 @@ class Alert {
   public Window Card;
 }
 
-// Native Windows hook entry: same decisions as win-attention.py (keep the two in sync), minus the WSL tty marker.
+// Native Windows hook entry: same decisions as win-attention.py (keep the two in sync), minus the WSL tty progress probe.
 static class HookMode {
   const string Hint = "点击跳到该标签页 · 右键关闭";
   static readonly JavaScriptSerializer Js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
@@ -224,7 +224,7 @@ static class HookMode {
       new KeyValuePair<string, string>("summary", Clean(summary, 140)), new KeyValuePair<string, string>("glyph", glyph),
       new KeyValuePair<string, string>("progress", progress.ToString(CultureInfo.InvariantCulture)),
       new KeyValuePair<string, string>("hint", Hint), new KeyValuePair<string, string>("demo", args.Contains("--demo") ? "1" : "0"),
-      new KeyValuePair<string, string>("marker", ""), new KeyValuePair<string, string>("title", AiTitle(transcript)) };
+      new KeyValuePair<string, string>("probe", ""), new KeyValuePair<string, string>("title", AiTitle(transcript)) };
     string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Join("\n", fields.Select(kv => kv.Key + "\t" + kv.Value))));
     // detached child (no inherited handles) so the hook returns at once; it joins or becomes the host
     try { Process.Start(new ProcessStartInfo(exe, b64) { UseShellExecute = true }); } catch { }
@@ -232,7 +232,7 @@ static class HookMode {
 }
 
 class Host {
-  const double CardSeconds = 1800, BadgeSeconds = 1800, LocateMs = 3000;
+  const double CardSeconds = 1800, BadgeSeconds = 1800, ProbeMs = 3000;
   const int MaxCards = 4;
 
   readonly string pipeName, foundDir;
@@ -343,7 +343,7 @@ class Host {
     var a = new Alert();
     a.Project = G(d, "project"); a.Label = G(d, "label"); a.Summary = G(d, "summary"); a.Hint = G(d, "hint"); a.Glyph = G(d, "glyph");
     a.Key = G(d, "key") != "" ? G(d, "key") : a.Project;
-    a.Marker = G(d, "marker"); a.Title = G(d, "title"); a.Demo = G(d, "demo") == "1";
+    a.Probe = G(d, "probe"); a.Title = G(d, "title"); a.Demo = G(d, "demo") == "1";
     int.TryParse(G(d, "progress"), out a.Progress);
     try { a.Color = (Color)ColorConverter.ConvertFromString(G(d, "color")); } catch { a.Color = Color.FromRgb(0x60, 0xA5, 0xFA); }
 
@@ -354,35 +354,115 @@ class Host {
   }
 
   // ---------- tab lookup (UI Automation runs off the UI thread) ----------
+  // WSL: progress probe first (does not depend on the tab title), then the session title. Native Windows: title only.
   void StartLocate(Alert a) {
-    string marker = a.Marker, title = a.Title;
+    string probe = a.Probe, title = a.Title;
     ThreadPool.QueueUserWorkItem(_ => {
-      IntPtr hwnd = IntPtr.Zero; AutomationElement tab = null; bool sel = false; string how = "fallback-window";
+      IntPtr hwnd = IntPtr.Zero; AutomationElement tab = null; bool sel = false;
+      var how = new List<string>();
+      if (probe != "") {
+        int n = 0;
+        try { Probe(probe, out hwnd, out tab, out n); } catch { }
+        how.Add(tab != null ? "progress(" + n + ")" : n == 0 ? "progress-skip" : "progress-miss(" + n + ")");
+      }
       // title may hold several candidates (custom /rename name first, then AI title), separated by \x1f
-      foreach (string t in title.Split('\x1f')) {
-        if (t == "" || tab != null) continue;
-        try { FindTabByTitle(t, out hwnd, out tab); } catch { }
-        if (tab != null) how = "title";
-      }
-      if (tab == null && marker != "") {
-        var sw = Stopwatch.StartNew();
-        while (tab == null && sw.ElapsedMilliseconds < LocateMs) {
-          try { FindTab(marker, out hwnd, out tab); } catch { }
-          if (tab == null) Thread.Sleep(100);
+      if (tab == null) {
+        var hits = new List<int>();
+        foreach (string t in title.Split('\x1f')) {
+          if (t == "" || tab != null) continue;
+          try { hits.Add(FindTabByTitle(t, out hwnd, out tab)); } catch { }
         }
-        if (tab != null) {
-          how = "marker";
-          try { File.WriteAllText(System.IO.Path.Combine(foundDir, "found-" + marker), ""); } catch { }
-        }
+        if (tab != null) how.Add("title");
+        else if (hits.Count > 0) how.Add("title-miss(hits=" + string.Join("/", hits) + ")");
       }
+      if (tab == null) how.Add("fallback-window");
       if (tab != null) { try { sel = ((SelectionItemPattern)tab.GetCurrentPattern(SelectionItemPattern.Pattern)).Current.IsSelected; } catch { } }
-      Log(string.Format("locate key={0} by={1} selected={2}", a.Key.Length > 8 ? a.Key.Substring(0, 8) : a.Key, how, sel));
+      Log(string.Format("locate key={0} by={1} selected={2}", a.Key.Length > 8 ? a.Key.Substring(0, 8) : a.Key, string.Join(",", how), sel));
       disp.BeginInvoke(new Action(() => OnLocated(a, hwnd, tab, sel)));
     });
   }
 
-  // Claude Code titles its tab "<spinner> <ai title>"; only trust a unique match
-  static void FindTabByTitle(string title, out IntPtr hwnd, out AutomationElement tab) {
+  // ---------- progress probe ----------
+  // WT exposes each tab's progress ring (OSC 9;4) through UIA as HeaderProgressRing with its value (0-100; the
+  // normal/warning/error state is not exposed). Handshake with the hook's background process (win-attention.py):
+  //   1. snapshot every tab's ring, pick N in 1..99 that no tab shows and no other probe uses, write ready-<id> = N
+  //   2. the hook keeps writing OSC 9;4;1;N to Claude's tty; the one tab whose ring reads N is ours
+  //   3. write found-<id> = "<state>;<value>" (that tab's ring before the probe); the hook writes it back and stops
+  static readonly HashSet<int> probeBusy = new HashSet<int>();
+  static readonly Random rng = new Random();
+  static readonly PropertyCondition RingCond = new PropertyCondition(AutomationElement.AutomationIdProperty, "HeaderProgressRing");
+
+  class Ring { public IntPtr Hwnd; public AutomationElement Tab; public string Rid, Spec; public int Value = -1; }
+
+  static List<Ring> ScanRings() {
+    var list = new List<Ring>();
+    var walker = TreeWalker.ControlViewWalker;
+    var wins = AutomationElement.RootElement.FindAll(TreeScope.Children,
+      new PropertyCondition(AutomationElement.ClassNameProperty, W.WtClass));
+    foreach (AutomationElement w in wins) {
+      foreach (AutomationElement r in w.FindAll(TreeScope.Descendants, RingCond)) {
+        try {
+          var t = walker.GetParent(r);
+          while (t != null && t.Current.ControlType != ControlType.TabItem) t = walker.GetParent(t);
+          if (t == null) continue;
+          var ring = new Ring { Hwnd = new IntPtr(w.Current.NativeWindowHandle), Tab = t, Rid = string.Join(".", t.GetRuntimeId()), Spec = "3;0" };
+          object p;   // indeterminate rings have no RangeValue
+          if (r.TryGetCurrentPattern(RangeValuePattern.Pattern, out p)) {
+            ring.Value = (int)Math.Round(((RangeValuePattern)p).Current.Value);
+            ring.Spec = "1;" + ring.Value.ToString(CultureInfo.InvariantCulture);
+          }
+          list.Add(ring);
+        } catch { }
+      }
+    }
+    return list;
+  }
+
+  void WriteAtomic(string path, string text) {
+    string tmp = path + ".tmp";
+    File.WriteAllText(tmp, text);
+    try { File.Delete(path); } catch { }
+    File.Move(tmp, path);
+  }
+
+  void Probe(string id, out IntPtr hwnd, out AutomationElement tab, out int picked) {
+    hwnd = IntPtr.Zero; tab = null; picked = 0;
+    string ready = System.IO.Path.Combine(foundDir, "ready-" + id), found = System.IO.Path.Combine(foundDir, "found-" + id);
+    List<Ring> before;
+    try { before = ScanRings(); } catch { before = new List<Ring>(); }
+    int n; HashSet<int> ours;
+    lock (probeBusy) {
+      var free = Enumerable.Range(1, 99).Where(v => !probeBusy.Contains(v) && !before.Any(r => r.Value == v)).ToList();
+      if (free.Count == 0) return;
+      n = free[rng.Next(free.Count)];
+      ours = new HashSet<int>(probeBusy);   // rings showing these are other probes' markers, not something to restore
+      probeBusy.Add(n);
+    }
+    picked = n;
+    string restore = "0;0";
+    try {
+      WriteAtomic(ready, n.ToString(CultureInfo.InvariantCulture));
+      var sw = Stopwatch.StartNew();
+      while (sw.ElapsedMilliseconds < ProbeMs) {
+        List<Ring> hits = null;
+        try { hits = ScanRings().Where(r => r.Value == n).ToList(); } catch { }
+        if (hits != null && hits.Count == 1) {
+          hwnd = hits[0].Hwnd; tab = hits[0].Tab;
+          var prev = before.FirstOrDefault(r => r.Rid == hits[0].Rid);
+          if (prev != null && !ours.Contains(prev.Value)) restore = prev.Spec;
+          break;
+        }
+        Thread.Sleep(100);
+      }
+    } finally {
+      try { WriteAtomic(found, restore); } catch { }   // also on timeout, so the hook stops writing at once
+      try { File.Delete(ready); } catch { }
+      lock (probeBusy) probeBusy.Remove(n);
+    }
+  }
+
+  // Claude Code titles its tab "<spinner> <session name>"; only trust a unique match. Returns the match count.
+  static int FindTabByTitle(string title, out IntPtr hwnd, out AutomationElement tab) {
     hwnd = IntPtr.Zero; tab = null; int hits = 0;
     var wins = AutomationElement.RootElement.FindAll(TreeScope.Children,
       new PropertyCondition(AutomationElement.ClassNameProperty, W.WtClass));
@@ -394,18 +474,7 @@ class Host {
       }
     }
     if (hits != 1) { hwnd = IntPtr.Zero; tab = null; }
-  }
-
-  static void FindTab(string marker, out IntPtr hwnd, out AutomationElement tab) {
-    hwnd = IntPtr.Zero; tab = null;
-    var wins = AutomationElement.RootElement.FindAll(TreeScope.Children,
-      new PropertyCondition(AutomationElement.ClassNameProperty, W.WtClass));
-    var cond = new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem),
-                                new PropertyCondition(AutomationElement.NameProperty, marker));
-    foreach (AutomationElement w in wins) {
-      var t = w.FindFirst(TreeScope.Descendants, cond);
-      if (t != null) { hwnd = new IntPtr(w.Current.NativeWindowHandle); tab = t; return; }
-    }
+    return hits;
   }
 
   void OnLocated(Alert a, IntPtr hwnd, AutomationElement tab, bool sel) {
