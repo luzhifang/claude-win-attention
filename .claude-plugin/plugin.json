@@ -1,0 +1,15 @@
+{
+  "name": "win-attention",
+  "version": "0.1.0",
+  "description": "WSL2 / 原生 Windows + Windows Terminal：Claude 需要你处理（任务完成、确认权限、选择、审批计划、压缩完成、/btw 回答）时，在 Windows 右下角弹出卡片，点击即可跳回对应标签页",
+  "author": {
+    "name": "luzhifang"
+  },
+  "license": "MIT",
+  "keywords": [
+    "wsl",
+    "windows",
+    "notification",
+    "hooks"
+  ]
+}
