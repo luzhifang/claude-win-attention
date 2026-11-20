@@ -597,9 +597,41 @@ class Host {
       W.SetForegroundWindow(h);
     }
     var tab = a.Tab;
-    if (tab != null) ThreadPool.QueueUserWorkItem(_ => {
-      try { ((SelectionItemPattern)tab.GetCurrentPattern(SelectionItemPattern.Pattern)).Select(); } catch { }
+    string key = a.Key.Length > 8 ? a.Key.Substring(0, 8) : a.Key;
+    ThreadPool.QueueUserWorkItem(_ => {
+      int[] old = null;   // terminal of the tab shown before the switch
+      if (tab != null) try {
+        var sel = (SelectionItemPattern)tab.GetCurrentPattern(SelectionItemPattern.Pattern);
+        if (!sel.Current.IsSelected) { old = TermRid(h); sel.Select(); }
+      } catch { }
+      Log(string.Format("focus key={0} {1}", key, FocusTerminal(h, old)));
     });
+  }
+
+  static readonly PropertyCondition TermCond = new PropertyCondition(AutomationElement.ClassNameProperty, "TermControl");
+
+  static int[] TermRid(IntPtr h) {
+    try { var t = AutomationElement.FromHandle(h).FindFirst(TreeScope.Descendants, TermCond); return t == null ? null : t.GetRuntimeId(); }
+    catch { return null; }
+  }
+
+  // UIA Select only switches the tab; keyboard focus does not follow, so typing / Enter went nowhere.
+  // Wait for the new tab's terminal (only the shown tab's TermControl is in the tree) and focus it.
+  static string FocusTerminal(IntPtr h, int[] old) {
+    string last = "none";
+    for (int i = 0; i < 12; i++) {
+      Thread.Sleep(i == 0 ? 30 : 80);
+      try {
+        var term = AutomationElement.FromHandle(h).FindFirst(TreeScope.Descendants, TermCond);
+        if (term == null) { last = "no-term"; continue; }
+        if (old != null && i < 8 && term.GetRuntimeId().SequenceEqual(old)) { last = "old-term"; continue; }
+        if (term.Current.HasKeyboardFocus) return "ok(already)";
+        term.SetFocus();
+        if (AutomationElement.FocusedElement.Current.ClassName == "TermControl") return "ok(set)";
+        last = "focused=" + AutomationElement.FocusedElement.Current.ClassName;
+      } catch (Exception e) { last = e.GetType().Name; }
+    }
+    return "fail(" + last + ")";
   }
 
   // ---------- taskbar ----------
